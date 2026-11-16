@@ -1,0 +1,698 @@
+<#
+.SYNOPSIS
+    Recoil Compensation - v15.8 (web-only UI + speed)
+.DESCRIPTION
+    - C# core: recoil logic, writes status.txt
+    - PowerShell: local HTTP server on 127.0.0.1:8765
+    - Console menu removed; only status line + Web UI URL
+    - Web UI: sliders, speed, profiles, pause
+.NOTES
+    Run as Administrator. Save file as UTF-8 with BOM.
+    Open http://127.0.0.1:8765/ in your browser.
+#>
+
+function Start-RecoilControl {
+    $ErrorActionPreference = 'Stop'
+    Set-StrictMode -Version 3
+
+    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Host "ERROR: Run as Administrator" -ForegroundColor Red
+        Start-Sleep 5
+        return
+    }
+
+    $configDir  = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'RecoilProfiles'
+    $statusFile = Join-Path $configDir 'status.txt'
+    if (-not (Test-Path $configDir)) { New-Item -ItemType Directory -Path $configDir | Out-Null }
+
+    # ---------- C# core ----------
+    $recoilCode = @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public class AdvancedRecoilControl
+{
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MOUSEINPUT
+    {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct INPUT
+    {
+        public uint type;
+        public MOUSEINPUT mi;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    private const uint INPUT_MOUSE = 0;
+    private const uint MOUSEEVENTF_MOVE = 0x0001;
+
+    private static readonly Random rand = new Random();
+    private static volatile bool isActive = true;
+    private static volatile bool isPaused = false;
+    private static readonly HashSet<int> heldKeys = new HashSet<int>();
+
+    private static readonly string configDir =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "RecoilProfiles");
+    private static readonly string statusFile = Path.Combine(configDir, "status.txt");
+    private static string currentProfile = "default";
+
+    private static double verticalRecoil = 1.5;
+    private static double horizontalRecoil = 0.0;
+    private static int    speed = 50;        // 1..100, 50 = normal
+
+    private static DateTime lastStatusWrite = DateTime.MinValue;
+
+    public static void StopControl() { isActive = false; }
+
+    private static bool KeyDown(int vKey)
+    {
+        return (GetAsyncKeyState(vKey) & 0x8000) != 0;
+    }
+
+    private static bool KeyPressed(int vKey)
+    {
+        bool down = KeyDown(vKey);
+        if (down)
+        {
+            if (heldKeys.Contains(vKey)) return false;
+            heldKeys.Add(vKey);
+            return true;
+        }
+        heldKeys.Remove(vKey);
+        return false;
+    }
+
+    private static void MoveMouse(int dx, int dy)
+    {
+        INPUT[] inputs = new INPUT[1];
+        inputs[0].type = INPUT_MOUSE;
+        inputs[0].mi.dx = dx;
+        inputs[0].mi.dy = dy;
+        inputs[0].mi.mouseData = 0;
+        inputs[0].mi.dwFlags = MOUSEEVENTF_MOVE;
+        inputs[0].mi.time = 0;
+        inputs[0].mi.dwExtraInfo = IntPtr.Zero;
+        SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+    }
+
+    private static void WriteStatusFile()
+    {
+        try
+        {
+            Directory.CreateDirectory(configDir);
+            string content =
+                "PROFILE=" + currentProfile + Environment.NewLine +
+                "VERTICAL=" + verticalRecoil.ToString("0.00", CultureInfo.InvariantCulture) + Environment.NewLine +
+                "HORIZONTAL=" + horizontalRecoil.ToString("0.00", CultureInfo.InvariantCulture) + Environment.NewLine +
+                "SPEED=" + speed.ToString(CultureInfo.InvariantCulture) + Environment.NewLine +
+                "PAUSED=" + (isPaused ? "1" : "0") + Environment.NewLine;
+            string tmp = statusFile + ".tmp";
+            File.WriteAllText(tmp, content);
+            if (File.Exists(statusFile)) File.Delete(statusFile);
+            File.Move(tmp, statusFile);
+            lastStatusWrite = File.GetLastWriteTimeUtc(statusFile);
+        }
+        catch { }
+    }
+
+    private static void ReloadFromStatusIfChanged()
+    {
+        try
+        {
+            if (!File.Exists(statusFile)) return;
+            DateTime mt = File.GetLastWriteTimeUtc(statusFile);
+            if (mt == lastStatusWrite) return;
+
+            string[] lines = File.ReadAllLines(statusFile);
+            foreach (string line in lines)
+            {
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                string key = line.Substring(0, eq);
+                string val = line.Substring(eq + 1);
+                switch (key)
+                {
+                    case "PROFILE":
+                        if (!string.IsNullOrEmpty(val) && val != currentProfile)
+                        {
+                            string p = Path.Combine(configDir, val + ".cfg");
+                            if (File.Exists(p))
+                            {
+                                string[] cfg = File.ReadAllLines(p);
+                                if (cfg.Length >= 2)
+                                {
+                                    verticalRecoil   = double.Parse(cfg[0], CultureInfo.InvariantCulture);
+                                    horizontalRecoil = double.Parse(cfg[1], CultureInfo.InvariantCulture);
+                                }
+                                if (cfg.Length >= 3)
+                                {
+                                    int sp; if (int.TryParse(cfg[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out sp))
+                                        speed = Math.Max(1, Math.Min(100, sp));
+                                }
+                            }
+                            currentProfile = val;
+                        }
+                        break;
+                    case "VERTICAL":
+                        double v; if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out v)) verticalRecoil = v;
+                        break;
+                    case "HORIZONTAL":
+                        double h; if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out h)) horizontalRecoil = h;
+                        break;
+                    case "SPEED":
+                        int s; if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out s)) speed = Math.Max(1, Math.Min(100, s));
+                        break;
+                    case "PAUSED":
+                        isPaused = (val == "1");
+                        break;
+                }
+            }
+            lastStatusWrite = mt;
+        }
+        catch { }
+    }
+
+    private static void EnsureDefaultProfile()
+    {
+        Directory.CreateDirectory(configDir);
+        string path = Path.Combine(configDir, "default.cfg");
+        if (!File.Exists(path)) SaveConfig("default");
+    }
+
+    private static void LoadConfig(string profileName)
+    {
+        string filePath = Path.Combine(configDir, profileName + ".cfg");
+        if (!File.Exists(filePath)) return;
+        try
+        {
+            string[] lines = File.ReadAllLines(filePath);
+            if (lines.Length >= 2)
+            {
+                verticalRecoil   = double.Parse(lines[0], CultureInfo.InvariantCulture);
+                horizontalRecoil = double.Parse(lines[1], CultureInfo.InvariantCulture);
+                if (lines.Length >= 3)
+                {
+                    int sp; if (int.TryParse(lines[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out sp))
+                        speed = Math.Max(1, Math.Min(100, sp));
+                }
+                currentProfile = profileName;
+            }
+        }
+        catch { }
+    }
+
+    private static void SaveConfig(string profileName)
+    {
+        Directory.CreateDirectory(configDir);
+        File.WriteAllText(
+            Path.Combine(configDir, profileName + ".cfg"),
+            verticalRecoil.ToString("0.00", CultureInfo.InvariantCulture) + Environment.NewLine +
+            horizontalRecoil.ToString("0.00", CultureInfo.InvariantCulture) + Environment.NewLine +
+            speed.ToString(CultureInfo.InvariantCulture) + Environment.NewLine);
+        currentProfile = profileName;
+    }
+
+    public static void RunControl()
+    {
+        EnsureDefaultProfile();
+        LoadConfig("default");
+        WriteStatusFile();
+
+        const int VK_LBUTTON = 0x01;
+        const int VK_F7      = 0x76;
+        const int VK_F12     = 0x7B;
+
+        while (isActive)
+        {
+            ReloadFromStatusIfChanged();
+
+            if (KeyPressed(VK_F12)) break;
+            if (KeyPressed(VK_F7)) { isPaused = !isPaused; WriteStatusFile(); }
+            if (isPaused) { Thread.Sleep(50); continue; }
+
+            if (KeyDown(VK_LBUTTON))
+            {
+                double v = verticalRecoil * (0.9 + rand.NextDouble() * 0.2);
+                double h = horizontalRecoil + (rand.NextDouble() - 0.5);
+                MoveMouse((int)Math.Round(h), (int)Math.Round(v));
+
+                int baseDelay = rand.Next(15, 31);
+                int delay = (int)Math.Round(baseDelay * (100.0 / Math.Max(1, speed)));
+                Thread.Sleep(Math.Max(1, delay));
+            }
+
+            Thread.Sleep(10);
+        }
+
+        isActive = false;
+        WriteStatusFile();
+    }
+}
+'@
+
+    # ---------- PowerShell helpers ----------
+    function Get-Status {
+        $result = @{
+            Profile    = 'default'
+            Vertical   = 1.5
+            Horizontal = 0.0
+            Speed      = 50
+            Paused     = $false
+            MTime      = [datetime]::MinValue
+        }
+        if (Test-Path $statusFile) {
+            try {
+                $result.MTime = (Get-Item -LiteralPath $statusFile).LastWriteTimeUtc
+                foreach ($line in Get-Content -LiteralPath $statusFile -ErrorAction SilentlyContinue) {
+                    $kv = $line -split '=', 2
+                    if ($kv.Count -ne 2) { continue }
+                    switch ($kv[0]) {
+                        'PROFILE'    { $result.Profile = $kv[1] }
+                        'VERTICAL'   { $v = 0.0; [void][double]::TryParse($kv[1], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$v); $result.Vertical = $v }
+                        'HORIZONTAL' { $h = 0.0; [void][double]::TryParse($kv[1], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$h); $result.Horizontal = $h }
+                        'SPEED'      { $s = 50; [void][int]::TryParse($kv[1], [ref]$s); $result.Speed = [Math]::Max(1, [Math]::Min(100, $s)) }
+                        'PAUSED'     { $result.Paused = ($kv[1] -eq '1') }
+                    }
+                }
+            } catch { }
+        }
+        return $result
+    }
+
+    # ---------- HTML page ----------
+    $htmlPage = @'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Recoil Control Panel</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: Segoe UI, Arial, sans-serif; background:#0f1115; color:#e6e6e6; margin:0; padding:24px; }
+  h1 { font-size:20px; margin:0 0 16px; color:#7fd1ff; }
+  .card { background:#171a21; border:1px solid #2a2f3a; border-radius:10px; padding:16px; margin-bottom:16px; max-width:720px; }
+  .row { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
+  .row label { width:130px; color:#9aa4b2; }
+  input[type=range] { flex:1; }
+  input[type=number] { width:90px; background:#0f1115; color:#e6e6e6; border:1px solid #2a2f3a; border-radius:6px; padding:4px 6px; }
+  input[type=text] { background:#0f1115; color:#e6e6e6; border:1px solid #2a2f3a; border-radius:6px; padding:6px; }
+  button { background:#243044; color:#e6e6e6; border:1px solid #33415a; border-radius:6px; padding:6px 12px; cursor:pointer; }
+  button:hover { background:#2c3a52; }
+  button.primary { background:#1f6feb; border-color:#1f6feb; }
+  button.danger { background:#8b1e1e; border-color:#8b1e1e; }
+  select { background:#0f1115; color:#e6e6e6; border:1px solid #2a2f3a; border-radius:6px; padding:6px; }
+  .status { display:inline-block; padding:4px 10px; border-radius:999px; font-size:12px; }
+  .active { background:#14361f; color:#6ee787; }
+  .paused { background:#3a2a10; color:#f0b429; }
+  .muted { color:#6b7280; font-size:12px; margin-top:8px; }
+</style>
+</head>
+<body>
+  <h1>Recoil Control Panel</h1>
+
+  <div class="card">
+    <div class="row">
+      <label>Status</label>
+      <span id="statusBadge" class="status active">ACTIVE</span>
+      <button id="pauseBtn">Pause</button>
+    </div>
+    <div class="row">
+      <label>Profile</label>
+      <select id="profileSelect"></select>
+      <button id="loadBtn">Load</button>
+      <input type="text" id="profileName" placeholder="new name" style="width:140px;">
+      <button id="saveBtn" class="primary">Save</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label>Vertical</label>
+      <button data-act="v-" title="-0.1">−</button>
+      <input type="range" id="vRange" min="0" max="55" step="0.1" value="1.5">
+      <button data-act="v+" title="+0.1">+</button>
+      <input type="number" id="vNum" step="0.1" value="1.5">
+    </div>
+    <div class="row">
+      <label>Horizontal</label>
+      <button data-act="h-" title="-0.5">−</button>
+      <input type="range" id="hRange" min="-55" max="55" step="0.5" value="0">
+      <button data-act="h+" title="+0.5">+</button>
+      <input type="number" id="hNum" step="0.5" value="0">
+    </div>
+    <div class="row">
+      <label>Speed (1–100)</label>
+      <button data-act="s-" title="-5">−</button>
+      <input type="range" id="sRange" min="1" max="100" step="1" value="50">
+      <button data-act="s+" title="+5">+</button>
+      <input type="number" id="sNum" step="1" value="50">
+    </div>
+    <div class="row">
+      <label></label>
+      <button id="resetBtn" class="danger">Reset to defaults</button>
+    </div>
+    <div class="muted">
+      Speed scales the delay between compensation steps: 100 = 2× faster than default, 50 = normal, 10 = very slow.<br>
+      All values are written instantly to status.txt and picked up by the C# thread in ~10 ms.
+    </div>
+  </div>
+
+<script>
+const $ = s => document.querySelector(s);
+let suppress = false;
+
+function fmt(n){ return (Math.round(n*100)/100).toFixed(2); }
+
+async function getStatus(){
+  const r = await fetch('/api/status');
+  return await r.json();
+}
+async function postSet(payload){
+  const r = await fetch('/api/set', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  return await r.json();
+}
+async function postLoad(name){
+  return await (await fetch('/api/profile/load', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name}) })).json();
+}
+async function postSave(name){
+  return await (await fetch('/api/profile/save', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name}) })).json();
+}
+
+function applyState(s){
+  if (!suppress){
+    $('#vRange').value = s.vertical;
+    $('#vNum').value   = fmt(s.vertical);
+    $('#hRange').value = s.horizontal;
+    $('#hNum').value   = fmt(s.horizontal);
+    $('#sRange').value = s.speed;
+    $('#sNum').value   = s.speed;
+  }
+  $('#statusBadge').textContent = s.paused ? 'PAUSED' : 'ACTIVE';
+  $('#statusBadge').className   = 'status ' + (s.paused ? 'paused' : 'active');
+  $('#pauseBtn').textContent    = s.paused ? 'Resume' : 'Pause';
+  $('#profileSelect').value     = s.profile;
+}
+
+async function refresh(){
+  try {
+    const s = await getStatus();
+    applyState(s);
+    const profs = s.profiles || [];
+    const sel = $('#profileSelect');
+    const current = sel.value;
+    sel.innerHTML = '';
+    for (const p of profs){
+      const o = document.createElement('option');
+      o.value = p; o.textContent = p;
+      sel.appendChild(o);
+    }
+    if (profs.includes(current)) sel.value = current;
+    else if (profs.includes(s.profile)) sel.value = s.profile;
+  } catch(e) { console.error(e); }
+}
+
+async function setVal(v, h, sp){
+  suppress = true;
+  await postSet({ vertical: v, horizontal: h, speed: sp });
+  suppress = false;
+}
+
+function wire(){
+  const vRange = $('#vRange'), hRange = $('#hRange'), sRange = $('#sRange');
+  const vNum = $('#vNum'), hNum = $('#hNum'), sNum = $('#sNum');
+
+  vRange.addEventListener('input', () => { vNum.value = fmt(parseFloat(vRange.value)); });
+  vRange.addEventListener('change', () => setVal(parseFloat(vRange.value), parseFloat(hRange.value), parseInt(sRange.value)));
+  hRange.addEventListener('input', () => { hNum.value = fmt(parseFloat(hRange.value)); });
+  hRange.addEventListener('change', () => setVal(parseFloat(vRange.value), parseFloat(hRange.value), parseInt(sRange.value)));
+  sRange.addEventListener('input', () => { sNum.value = parseInt(sRange.value); });
+  sRange.addEventListener('change', () => setVal(parseFloat(vRange.value), parseFloat(hRange.value), parseInt(sRange.value)));
+
+  vNum.addEventListener('change', () => setVal(parseFloat(vNum.value)||0, parseFloat(hRange.value), parseInt(sRange.value)));
+  hNum.addEventListener('change', () => setVal(parseFloat(vRange.value), parseFloat(hNum.value)||0, parseInt(sRange.value)));
+  sNum.addEventListener('change', () => setVal(parseFloat(vRange.value), parseFloat(hRange.value), parseInt(sNum.value)||50));
+
+  document.querySelectorAll('button[data-act]').forEach(b => {
+    b.addEventListener('click', () => {
+      const v = parseFloat(vRange.value);
+      const h = parseFloat(hRange.value);
+      const sp = parseInt(sRange.value);
+      const a = b.dataset.act;
+      if (a === 'v-') setVal(Math.max(0, v-0.1), h, sp);
+      if (a === 'v+') setVal(Math.min(55, v+0.1), h, sp);
+      if (a === 'h-') setVal(v, Math.max(-55, h-0.5), sp);
+      if (a === 'h+') setVal(v, Math.min(55, h+0.5), sp);
+      if (a === 's-') setVal(v, h, Math.max(1, sp-5));
+      if (a === 's+') setVal(v, h, Math.min(100, sp+5));
+    });
+  });
+
+  $('#pauseBtn').addEventListener('click', async () => {
+    const s = await getStatus();
+    await postSet({ paused: !s.paused });
+    refresh();
+  });
+
+  $('#resetBtn').addEventListener('click', () => setVal(1.5, 0.0, 50));
+
+  $('#loadBtn').addEventListener('click', async () => {
+    const name = $('#profileSelect').value;
+    if (name) { await postLoad(name); refresh(); }
+  });
+
+  $('#saveBtn').addEventListener('click', async () => {
+    let name = ($('#profileName').value || '').trim();
+    if (!name) name = $('#profileSelect').value || 'default';
+    await postSave(name);
+    $('#profileName').value = '';
+    refresh();
+  });
+}
+
+wire();
+refresh();
+setInterval(refresh, 300);
+</script>
+</body>
+</html>
+'@
+
+    # ---------- HTTP server in a separate runspace ----------
+    $listener = $null
+    $rs = $null
+    $ps = $null
+
+    function Start-WebServerSimple {
+        param([string]$Html)
+
+        $l = New-Object System.Net.HttpListener
+        $l.Prefixes.Add('http://127.0.0.1:8765/')
+        try { $l.Start() } catch {
+            Write-Host ("Web UI disabled: " + $_.Exception.Message) -ForegroundColor Yellow
+            return $null
+        }
+
+        $runspace = [RunspaceFactory]::CreateRunspace()
+        $runspace.Open()
+        $runspace.SessionStateProxy.SetVariable('configDir', $configDir)
+        $runspace.SessionStateProxy.SetVariable('statusFile', $statusFile)
+        $runspace.SessionStateProxy.SetVariable('htmlPage', $Html)
+        $runspace.SessionStateProxy.SetVariable('listener', $l)
+
+        $p = [PowerShell]::Create()
+        $p.Runspace = $runspace
+        [void]$p.AddScript({
+            function Get-Status {
+                $r = @{ Profile='default'; Vertical=1.5; Horizontal=0.0; Speed=50; Paused=$false }
+                if (Test-Path $statusFile) {
+                    foreach ($line in Get-Content -LiteralPath $statusFile -ErrorAction SilentlyContinue) {
+                        $kv = $line -split '=',2
+                        if ($kv.Count -ne 2) { continue }
+                        switch ($kv[0]) {
+                            'PROFILE'    { $r.Profile = $kv[1] }
+                            'VERTICAL'   { $v=0.0; [void][double]::TryParse($kv[1],[System.Globalization.NumberStyles]::Float,[System.Globalization.CultureInfo]::InvariantCulture,[ref]$v); $r.Vertical=$v }
+                            'HORIZONTAL' { $h=0.0; [void][double]::TryParse($kv[1],[System.Globalization.NumberStyles]::Float,[System.Globalization.CultureInfo]::InvariantCulture,[ref]$h); $r.Horizontal=$h }
+                            'SPEED'      { $s=50; [void][int]::TryParse($kv[1],[ref]$s); $r.Speed=[Math]::Max(1,[Math]::Min(100,$s)) }
+                            'PAUSED'     { $r.Paused = ($kv[1] -eq '1') }
+                        }
+                    }
+                }
+                return $r
+            }
+            function Set-StatusAtomic($Profile,$Vertical,$Horizontal,$Speed,$Paused) {
+                $c = @(
+                    "PROFILE=$Profile"
+                    "VERTICAL=$($Vertical.ToString('0.00',[System.Globalization.CultureInfo]::InvariantCulture))"
+                    "HORIZONTAL=$($Horizontal.ToString('0.00',[System.Globalization.CultureInfo]::InvariantCulture))"
+                    "SPEED=$Speed"
+                    "PAUSED=$([int]$Paused)"
+                ) -join [Environment]::NewLine
+                $tmp = "$statusFile.tmp"
+                Set-Content -LiteralPath $tmp -Value $c -Encoding UTF8
+                if (Test-Path $statusFile) { Remove-Item -LiteralPath $statusFile -Force }
+                Move-Item -LiteralPath $tmp -Destination $statusFile -Force
+            }
+            function Get-ProfileList {
+                if (-not (Test-Path $configDir)) { return @() }
+                Get-ChildItem -LiteralPath $configDir -Filter '*.cfg' -ErrorAction SilentlyContinue |
+                    ForEach-Object { $_.BaseName } | Sort-Object
+            }
+            function Load-ProfileByName($Name) {
+                $file = Join-Path $configDir "$Name.cfg"
+                if (-not (Test-Path $file)) { return $false }
+                $lines = Get-Content -LiteralPath $file -ErrorAction SilentlyContinue
+                if (-not $lines -or $lines.Count -lt 2) { return $false }
+                $v=0.0; $h=0.0; $sp=50
+                [void][double]::TryParse($lines[0],[System.Globalization.NumberStyles]::Float,[System.Globalization.CultureInfo]::InvariantCulture,[ref]$v)
+                [void][double]::TryParse($lines[1],[System.Globalization.NumberStyles]::Float,[System.Globalization.CultureInfo]::InvariantCulture,[ref]$h)
+                if ($lines.Count -ge 3) { [void][int]::TryParse($lines[2],[ref]$sp) }
+                $sp = [Math]::Max(1,[Math]::Min(100,$sp))
+                $s = Get-Status
+                Set-StatusAtomic -Profile $Name -Vertical $v -Horizontal $h -Speed $sp -Paused $s.Paused
+                return $true
+            }
+            function Save-ProfileByName($Name) {
+                $s = Get-Status
+                $c = @(
+                    $s.Vertical.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+                    $s.Horizontal.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+                    $s.Speed
+                ) -join [Environment]::NewLine
+                Set-Content -LiteralPath (Join-Path $configDir "$Name.cfg") -Value $c -Encoding UTF8
+            }
+
+            while ($listener.IsListening) {
+                try { $ctx = $listener.GetContext() } catch { break }
+                $req = $ctx.Request; $res = $ctx.Response
+                try {
+                    $path = $req.Url.AbsolutePath
+                    $method = $req.HttpMethod
+                    if ($method -eq 'GET' -and $path -eq '/') {
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes($htmlPage)
+                        $res.ContentType = 'text/html; charset=utf-8'
+                        $res.ContentLength64 = $bytes.Length
+                        $res.OutputStream.Write($bytes,0,$bytes.Length)
+                    }
+                    elseif ($method -eq 'GET' -and $path -eq '/api/status') {
+                        $s = Get-Status
+                        $profiles = @(Get-ProfileList)
+                        $obj = [ordered]@{ profile=$s.Profile; vertical=$s.Vertical; horizontal=$s.Horizontal; speed=$s.Speed; paused=$s.Paused; profiles=$profiles }
+                        $json = $obj | ConvertTo-Json -Compress
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                        $res.ContentType='application/json'
+                        $res.ContentLength64=$bytes.Length
+                        $res.OutputStream.Write($bytes,0,$bytes.Length)
+                    }
+                    elseif ($method -eq 'POST' -and $path -eq '/api/set') {
+                        $reader = New-Object System.IO.StreamReader($req.InputStream,[System.Text.Encoding]::UTF8)
+                        $body = $reader.ReadToEnd(); $reader.Close()
+                        $data = $body | ConvertFrom-Json
+                        $s = Get-Status
+                        $v  = if ($null -ne $data.vertical)   { [double]$data.vertical }   else { $s.Vertical }
+                        $h  = if ($null -ne $data.horizontal) { [double]$data.horizontal } else { $s.Horizontal }
+                        $sp = if ($null -ne $data.speed)      { [int]$data.speed }         else { $s.Speed }
+                        $sp = [Math]::Max(1,[Math]::Min(100,$sp))
+                        $p  = if ($null -ne $data.paused)     { [bool]$data.paused }       else { $s.Paused }
+                        Set-StatusAtomic -Profile $s.Profile -Vertical $v -Horizontal $h -Speed $sp -Paused $p
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')
+                        $res.ContentType='application/json'
+                        $res.ContentLength64=$bytes.Length
+                        $res.OutputStream.Write($bytes,0,$bytes.Length)
+                    }
+                    elseif ($method -eq 'POST' -and $path -eq '/api/profile/load') {
+                        $reader = New-Object System.IO.StreamReader($req.InputStream,[System.Text.Encoding]::UTF8)
+                        $body = $reader.ReadToEnd(); $reader.Close()
+                        $data = $body | ConvertFrom-Json
+                        $ok = Load-ProfileByName ([string]$data.name)
+                        $json = if ($ok) {'{"ok":true}'} else {'{"ok":false}'}
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                        $res.ContentType='application/json'
+                        $res.ContentLength64=$bytes.Length
+                        $res.OutputStream.Write($bytes,0,$bytes.Length)
+                    }
+                    elseif ($method -eq 'POST' -and $path -eq '/api/profile/save') {
+                        $reader = New-Object System.IO.StreamReader($req.InputStream,[System.Text.Encoding]::UTF8)
+                        $body = $reader.ReadToEnd(); $reader.Close()
+                        $data = $body | ConvertFrom-Json
+                        $name = [string]$data.name
+                        if ([string]::IsNullOrWhiteSpace($name)) { $name = 'default' }
+                        Save-ProfileByName $name
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')
+                        $res.ContentType='application/json'
+                        $res.ContentLength64=$bytes.Length
+                        $res.OutputStream.Write($bytes,0,$bytes.Length)
+                    }
+                    else { $res.StatusCode = 404 }
+                } catch {
+                    try { $res.StatusCode = 500 } catch {}
+                } finally {
+                    try { $res.OutputStream.Close() } catch {}
+                }
+            }
+        })
+        $p.BeginInvoke() | Out-Null
+        return @{ Listener = $l; Runspace = $runspace; PS = $p }
+    }
+
+    # ---------- Main ----------
+    $recoilThread = $null
+    $web          = $null
+
+    try {
+        Add-Type -TypeDefinition $recoilCode -Language CSharp
+
+        $threadStart  = [Threading.ThreadStart]::CreateDelegate([Threading.ThreadStart], [AdvancedRecoilControl], "RunControl")
+        $recoilThread = New-Object System.Threading.Thread($threadStart)
+        $recoilThread.IsBackground = $true
+        $recoilThread.Start()
+
+        $web = Start-WebServerSimple -Html $htmlPage
+        if ($web) {
+            Write-Host "Web UI: http://127.0.0.1:8765/" -ForegroundColor Green
+        } else {
+            Write-Host "Web UI not available (port 8765 busy or access denied)" -ForegroundColor Yellow
+        }
+
+        Write-Host "System ACTIVE (console UI disabled - use Web UI)" -ForegroundColor Cyan
+        Write-Host "F7: Pause/Resume | F12: Exit" -ForegroundColor DarkGray
+
+        while ($recoilThread -ne $null -and $recoilThread.IsAlive) {
+            Start-Sleep -Milliseconds 300
+        }
+
+        Write-Host "System DEACTIVATED" -ForegroundColor Cyan
+    }
+    catch {
+        Write-Host ("ERROR: " + $_.Exception.Message) -ForegroundColor Red
+        Write-Host ("STACK: " + $_.ScriptStackTrace) -ForegroundColor DarkGray
+        Read-Host "Press ENTER to exit"
+    }
+    finally {
+        try { if ($recoilThread -ne $null) { [AdvancedRecoilControl]::StopControl() } } catch { }
+        try { if ($web -and $web.Listener) { $web.Listener.Stop(); $web.Listener.Close() } } catch { }
+        try { if ($web -and $web.PS) { $web.PS.Dispose() } } catch { }
+        try { if ($web -and $web.Runspace) { $web.Runspace.Close() } } catch { }
+    }
+}
+
+Start-RecoilControl
+Write-Host "Press any key to close..." -ForegroundColor White
+try { [Console]::ReadKey($true) | Out-Null } catch { }
+exit 0
