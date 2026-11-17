@@ -51,4 +51,5 @@
 
 ---
 
-## Структура проекта
+## Структура по запуску 
+powershell.exe -NoProfile -ExecutionPolicy Bypass -NoExit -File "C:\...\RecoilControl\Start-Recoil.ps1"
